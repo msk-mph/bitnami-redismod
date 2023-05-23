@@ -54,7 +54,12 @@ redis_conf_set() {
     value="${value//[$'\t\n\r']}"
     [[ "$value" = "" ]] && value="\"$value\""
 
-    replace_in_file "${REDIS_BASE_DIR}/etc/redis.conf" "^#*\s*${key} .*" "${key} ${value}" false
+    # Determine whether to enable the configuration for RDB persistence, if yes, do not enable the replacement operation
+    if [ "${key}" == "save" ];then
+        echo "${key} ${value}" >> "${REDIS_BASE_DIR}/etc/redis.conf"
+    else
+        replace_in_file "${REDIS_BASE_DIR}/etc/redis.conf" "^#*\s*${key} .*" "${key} ${value}" false
+    fi
 }
 
 ########################
@@ -154,7 +159,7 @@ redis_stop() {
 
     debug "Stopping Redis"
     if am_i_root; then
-        gosu "$REDIS_DAEMON_USER" "${REDIS_BASE_DIR}/bin/redis-cli" "${args[@]}" shutdown
+        run_as_user "$REDIS_DAEMON_USER" "${REDIS_BASE_DIR}/bin/redis-cli" "${args[@]}" shutdown
     else
         "${REDIS_BASE_DIR}/bin/redis-cli" "${args[@]}" shutdown
     fi
@@ -206,9 +211,9 @@ redis_validate() {
         fi
     fi
     if is_boolean_yes "$REDIS_TLS_ENABLED"; then
-        if [[ "$REDIS_PORT_NUMBER" == "$REDIS_TLS_PORT" ]] && [[ "$REDIS_PORT_NUMBER" != "6379" ]]; then
+        if [[ "$REDIS_PORT_NUMBER" == "$REDIS_TLS_PORT_NUMBER" ]] && [[ "$REDIS_PORT_NUMBER" != "6379" ]]; then
             # If both ports are assigned the same numbers and they are different to the default settings
-            print_validation_error "Environment variables REDIS_PORT_NUMBER and REDIS_TLS_PORT point to the same port number (${REDIS_PORT_NUMBER}). Change one of them or disable non-TLS traffic by setting REDIS_PORT_NUMBER=0"
+            print_validation_error "Environment variables REDIS_PORT_NUMBER and REDIS_TLS_PORT_NUMBER point to the same port number (${REDIS_PORT_NUMBER}). Change one of them or disable non-TLS traffic by setting REDIS_PORT_NUMBER=0"
         fi
         if [[ -z "$REDIS_TLS_CERT_FILE" ]]; then
             print_validation_error "You must provide a X.509 certificate in order to use TLS"
@@ -358,6 +363,9 @@ redis_initialize() {
 #########################
 redis_append_include_conf() {
     if [[ -f "$REDIS_OVERRIDES_FILE" ]]; then
+        # Remove all include statements including commented ones
+        redis_conf_set include "$REDIS_OVERRIDES_FILE"
+        redis_conf_unset "include"
         echo "include $REDIS_OVERRIDES_FILE" >> "${REDIS_BASE_DIR}/etc/redis.conf"
     fi
 }
@@ -396,23 +404,38 @@ redis_configure_default() {
         # Enable AOF https://redis.io/topics/persistence#append-only-file
         # Leave default fsync (every second)
         redis_conf_set appendonly "${REDIS_AOF_ENABLED}"
+
+        #The value stored in $i here is the number of seconds and times of save rules in redis rdb mode
+        if [ -z "${REDIS_RDB_POLICY}" ];then
+          redis_conf_set save ""
+        else
+          for i in ${REDIS_RDB_POLICY};do
+            redis_conf_set save "${i//#/ }"
+          done
+        fi
+
         redis_conf_set port "$REDIS_PORT_NUMBER"
         # TLS configuration
         if is_boolean_yes "$REDIS_TLS_ENABLED"; then
-            if [[ "$REDIS_PORT_NUMBER" ==  "6379" ]] && [[ "$REDIS_TLS_PORT" ==  "6379" ]]; then
+            if [[ "$REDIS_PORT_NUMBER" ==  "6379" ]] && [[ "$REDIS_TLS_PORT_NUMBER" ==  "6379" ]]; then
                 # If both ports are set to default values, enable TLS traffic only
                 redis_conf_set port 0
-                redis_conf_set tls-port "$REDIS_TLS_PORT"
+                redis_conf_set tls-port "$REDIS_TLS_PORT_NUMBER"
             else
                 # Different ports were specified
-                redis_conf_set tls-port "$REDIS_TLS_PORT"
+                redis_conf_set tls-port "$REDIS_TLS_PORT_NUMBER"
             fi
             redis_conf_set tls-cert-file "$REDIS_TLS_CERT_FILE"
             redis_conf_set tls-key-file "$REDIS_TLS_KEY_FILE"
             redis_conf_set tls-ca-cert-file "$REDIS_TLS_CA_FILE"
+            ! is_empty_value "$REDIS_TLS_KEY_FILE_PASS" && redis_conf_set tls-key-file-pass "$REDIS_TLS_KEY_FILE_PASS"
             [[ -n "$REDIS_TLS_DH_PARAMS_FILE" ]] && redis_conf_set tls-dh-params-file "$REDIS_TLS_DH_PARAMS_FILE"
             redis_conf_set tls-auth-clients "$REDIS_TLS_AUTH_CLIENTS"
         fi
+        # Multithreading configuration
+        ! is_empty_value "$REDIS_IO_THREADS_DO_READS" && redis_conf_set "io-threads-do-reads" "$REDIS_IO_THREADS_DO_READS"
+        ! is_empty_value "$REDIS_IO_THREADS" && redis_conf_set "io-threads" "$REDIS_IO_THREADS"
+
         if [[ -n "$REDIS_PASSWORD" ]]; then
             redis_conf_set requirepass "$REDIS_PASSWORD"
         else
